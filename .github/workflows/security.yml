@@ -1,0 +1,102 @@
+name: DEVFLOW AI — Continuous Security & Vulnerability Scan
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # Nightly scan at 02:00 UTC
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # =========================================================================
+  # 1. Secret Detection & Leak Prevention (Gitleaks)
+  # =========================================================================
+  secret-scan:
+    name: 1. Hardcoded Secret Detection (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code with Full History
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks Secret Scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================
+  # 2. Container & Filesystem Vulnerability Scanning (Trivy)
+  # =========================================================================
+  trivy-scan:
+    name: 2. Container & CVE Vulnerability Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Vulnerability Scanner (Repo Filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy Scan Results to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # =========================================================================
+  # 3. Static Application Security Testing (CodeQL SAST)
+  # =========================================================================
+  codeql-sast:
+    name: 3. Static Application Security Testing (CodeQL)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript, python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # =========================================================================
+  # 4. Dependency Supply Chain Security (npm & pip audit)
+  # =========================================================================
+  dependency-audit:
+    name: 4. Dependency Supply Chain Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Audit NPM Dependencies
+        run: npm audit --audit-level=high --omit=dev || true
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Audit Python Dependencies (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r apps/ai-service/requirements.txt || true

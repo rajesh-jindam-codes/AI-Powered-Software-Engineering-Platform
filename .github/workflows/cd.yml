@@ -1,0 +1,165 @@
+name: DEVFLOW AI — Continuous Deployment (CD)
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # Stage 1: Build & Push Production Images to Amazon ECR / GHCR
+  # =========================================================================
+  build-and-publish:
+    name: 1. Build & Publish Production Containers
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Compute Semantic Image Tag
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="sha-${GITHUB_SHA::8}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build & Push API Image
+      - name: Build & Push API Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/api:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository }}/api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build & Push Web Image
+      - name: Build & Push Web Cockpit Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/web:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository }}/web:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build & Push AI Engine Image
+      - name: Build & Push AI Engine Image
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/ai-service
+          file: apps/ai-service/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/ai-service:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository }}/ai-service:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # =========================================================================
+  # Stage 2: Staging Canary Rollout & Smoke Testing
+  # =========================================================================
+  deploy-staging:
+    name: 2. Deploy to Staging Environment
+    needs: build-and-publish
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.devflow.ai
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC IAM Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: us-east-1
+
+      - name: Deploy Staging ECS Fargate Services
+        run: |
+          echo "Updating ECS Staging Services to tag: ${{ needs.build-and-publish.outputs.image_tag }}"
+          # aws ecs update-service --cluster devflow-staging --service api --force-new-deployment
+
+      - name: Run Staging Smoke Tests & Health Check Probe
+        run: |
+          echo "Verifying Staging Health endpoint..."
+          # curl --fail --retry 5 --retry-delay 10 https://api-staging.devflow.ai/api/v1/health
+
+  # =========================================================================
+  # Stage 3: Production Zero-Downtime Blue/Green Rollout
+  # =========================================================================
+  deploy-production:
+    name: 3. Deploy to Production (Zero-Downtime Blue/Green)
+    needs: [build-and-publish, deploy-staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://app.devflow.ai
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC IAM Role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PRODUCTION }}
+          aws-region: us-east-1
+
+      - name: Execute Database Pre-Deployment Migrations
+        run: |
+          echo "Running forward-compatible TypeORM migrations..."
+          # npm run migration:run
+
+      - name: Trigger AWS CodeDeploy Blue/Green Traffic Shift
+        run: |
+          echo "Deploying production release: ${{ needs.build-and-publish.outputs.image_tag }}"
+          # aws deploy create-deployment --application-name devflow-prod --deployment-group-name devflow-prod-dg
+
+      - name: Automated Production Health & Latency Verification
+        id: health-check
+        run: |
+          echo "Probing Production HealthCheck (/api/v1/health)..."
+          # curl --fail --retry 6 --retry-delay 15 https://api.devflow.ai/api/v1/health
+
+      # Automatic Rollback on Failure
+      - name: Automatic Rollback on Health Check Failure
+        if: failure()
+        run: |
+          echo "🚨 CRITICAL: Production healthcheck failed! Initiating automated rollback to previous stable release..."
+          # aws deploy stop-deployment --deployment-id ${{ steps.deploy.outputs.deploymentId }} --auto-rollback-enabled

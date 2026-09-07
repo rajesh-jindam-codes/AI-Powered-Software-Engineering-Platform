@@ -1,0 +1,187 @@
+name: DEVFLOW AI — Continuous Integration (CI)
+
+on:
+  push:
+    branches: [main, develop, 'release/*']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  # Stage 1: Quality Gate (Lint, Format & Typecheck)
+  # =========================================================================
+  quality-gate:
+    name: 1. Lint, Format & Strict Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Monorepo Dependencies
+        run: npm ci
+
+      - name: Code Formatting Check (Prettier)
+        run: npm run format:check
+
+      - name: Strict TypeScript Compilation Check
+        run: npm run typecheck
+
+      - name: Static Code Analysis (ESLint)
+        run: npm run lint
+
+  # =========================================================================
+  # Stage 2: Unit & Integration Tests (NestJS Monolith)
+  # =========================================================================
+  api-test-suite:
+    name: 2. API Unit & Integration Tests
+    needs: quality-gate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: devflow
+          POSTGRES_PASSWORD: devflow_test_password
+          POSTGRES_DB: devflow_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run 19 NestJS Unit & Integration Test Suites
+        run: npm test --workspace=@devflow/api
+        env:
+          DATABASE_URL: postgresql://devflow:devflow_test_password@localhost:5432/devflow_test_db
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET: devflow-ci-test-jwt-secret-key-2026
+
+  # =========================================================================
+  # Stage 3: Python AI Engine Test Suite
+  # =========================================================================
+  ai-engine-test-suite:
+    name: 3. Python AI Engine Tests
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ai-service
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx ruff
+
+      - name: Lint Python Service (Ruff)
+        run: ruff check .
+
+      - name: Run Pytest Test Suite
+        run: pytest -v tests/
+
+  # =========================================================================
+  # Stage 4: Monorepo Production Build
+  # =========================================================================
+  monorepo-build:
+    name: 4. Build Monorepo Artifacts
+    needs: [api-test-suite, ai-engine-test-suite]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build All Shared Packages and Apps
+        run: npm run build
+
+  # =========================================================================
+  # Stage 5: Container Image Build Verification
+  # =========================================================================
+  docker-build-check:
+    name: 5. Container Multi-Stage Build Check
+    needs: monorepo-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API Container Image (Validation)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: false
+          tags: devflow/api:ci-test
+
+      - name: Build Web Container Image (Validation)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: false
+          tags: devflow/web:ci-test
+
+      - name: Build AI Engine Container Image (Validation)
+        uses: docker/build-push-action@v5
+        with:
+          context: apps/ai-service
+          file: apps/ai-service/Dockerfile
+          push: false
+          tags: devflow/ai-service:ci-test

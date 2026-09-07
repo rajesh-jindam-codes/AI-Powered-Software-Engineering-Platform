@@ -1,0 +1,25 @@
+# Ephemeral Execution Sandbox Container for DEVFLOW AI Agent Tasks
+FROM node:20-bullseye-slim
+
+# Install basic toolchains (Python, Git, build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create unprivileged runner user
+RUN useradd -m -u 10001 -s /bin/bash sandboxuser
+
+WORKDIR /workspace
+RUN chown -R sandboxuser:sandboxuser /workspace
+
+USER sandboxuser
+
+# Environment parameters
+ENV CI=true
+ENV NODE_ENV=test
+ENV PYTHONUNBUFFERED=1
+
+CMD ["/bin/bash"]
